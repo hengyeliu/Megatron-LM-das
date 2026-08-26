@@ -10,13 +10,12 @@ import torch
 from datetime import timedelta
 from functools import wraps
 
-from megatron.training import get_args
 from megatron.training import inprocess_restart
 from megatron.core import mpu, tensor_parallel
 from megatron.core.utils import is_torch_min_version
 from megatron.training.utils import print_rank_0, warn_rank_0
 
-from hcu_megatron.training.arguments import get_adaptor_args
+from hcu_megatron.training import get_args
 
 
 def initialize_megatron_wrapper(initialize_megatron_func):
@@ -129,7 +128,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             'rank': args.rank,
             'timeout': timedelta(minutes=args.distributed_timeout_minutes),
         }
-        if os.getenv("LAUNCH_BACKEND", "mpirun") == "mpirun":
+        if os.getenv("MEGATRON_LAUNCH_BACKEND", "torchrun") == "mpirun":
             init_process_group_kwargs.update({'init_method': args.dist_url})
         if args.fake_process_group:
             assert is_torch_min_version(
@@ -212,8 +211,9 @@ def _set_random_seed(
             tensor_parallel.model_parallel_cuda_manual_seed(
                 seed, te_rng_tracker, inference_rng_tracker, use_cudagraphable_rng
             )
-        if get_adaptor_args().reproduce:
-            args = get_args()
+
+        args = get_args()
+        if args.reproduce:
             assert (args.attention_dropout > 0) is False, f"To utilize the reproduction function, args.attention_dropout = {args.attention_dropout} must be set to 0."
             assert (args.hidden_dropout > 0) is False, f"To utilize the reproduction function, args.hidden_dropout = {args.hidden_dropout} must be set to 0."
             torch.backends.cudnn.deterministic = True # 设置cudnn后端为确定性算法

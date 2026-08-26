@@ -7,8 +7,10 @@ import argparse
 
 from typing import Union
 from functools import wraps
-from megatron.training.arguments import add_megatron_arguments
+
 from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.training import get_args as megatron_get_args
+from megatron.training.arguments import add_megatron_arguments, parse_and_validate_args
 from megatron.training.utils import warn_rank_0
 
 from hcu_megatron.features_manager import ADAPTOR_FEATURES
@@ -77,7 +79,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
         args._explicit_args = explicit_args
 
     # Args from environment
-    if os.getenv("LAUNCH_BACKEND", "mpirun") == "torchrun":
+    if os.getenv("MEGATRON_LAUNCH_BACKEND", "torchrun") == "torchrun":
         args.rank = int(os.getenv('RANK', '0'))
         args.world_size = int(os.getenv("WORLD_SIZE", '1'))
     else:
@@ -243,6 +245,12 @@ def validate_args_func_decorator(validate_args_func):
         ORIGIN_ARG_VALUES["cross_entropy_fusion_impl"] = args.cross_entropy_fusion_impl
         args.cross_entropy_fusion_impl = "native"
 
+        if args.cuda_graph_impl == "full_iteration":
+            assert not args.overlap_p2p_comm, (
+                "overlap pipeline parallel communication is not supported with full-iteration cuda graphs. "
+                "If overlap_p2p_comm is True, cuda graph replay will hang"
+            )
+
         args = validate_args_func(args, defaults)
 
         # print env vars
@@ -313,42 +321,28 @@ def _print_env_vars(title, exclude_vars=None):
 
 _ADAPTOR_ARGS = None
 
-def add_args(args, key, value):
-    if key is not None:
-        key = key[2:].replace('-', '_')
-        if value is None:
-            value = True
-        elif len(value) == 1:
-            value = value[0]
-        setattr(args, key, value)
-
-
-def parser_unknown_args(args, unknown):
-    i = 0
-    key = value = None
-    while i < len(unknown):
-        if unknown[i].startswith("--"):
-            add_args(args, key, value)
-            key = unknown[i]
-            value = None
-        else:
-            if value is None:
-                value = [unknown[i]]
-            else:
-                value.append(unknown[i])
-        i += 1
-    add_args(args, key, value)
-
-
 def get_adaptor_args():
     global _ADAPTOR_ARGS
     if _ADAPTOR_ARGS is None:
         parser = argparse.ArgumentParser(description='Adaptor Arguments', allow_abbrev=False)
-        _ADAPTOR_ARGS, unknown = process_adaptor_args(parser).parse_known_args()
-        parser_unknown_args(_ADAPTOR_ARGS, unknown)
+        _ADAPTOR_ARGS, _ = process_adaptor_args(parser).parse_known_args()
+
     return _ADAPTOR_ARGS
 
 
 def destroy_adaptor_args():
     global _ADAPTOR_ARGS
     _ADAPTOR_ARGS = None
+
+
+def get_args():
+    try:
+        args = megatron_get_args()
+    except AssertionError:
+        print(
+            "WARNING: args is not initialized. Initializing args",
+            flush=True,
+        )
+        args = parse_and_validate_args()
+
+    return args
