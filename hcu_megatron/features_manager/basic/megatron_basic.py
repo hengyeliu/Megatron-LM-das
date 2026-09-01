@@ -246,11 +246,15 @@ class MegatronBasicFeature(AbstractFeature):
                                         apply_wrapper=True)
 
     def register_pipeline_parallel_patches(self, patch_manager, args):
+        from hcu_megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
         from hcu_megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
 
         # replace set_ideal_affinity_for_current_gpu with a no-op func
         patch_manager.register_patch("megatron.core.pipeline_parallel.utils.set_ideal_affinity_for_current_gpu",
                                     set_ideal_affinity_for_current_gpu)
+        # support full-iteration CUDA Graphs
+        patch_manager.register_patch("megatron.core.pipeline_parallel.p2p_communication.P2PCommunicator._communicate",
+                                    P2PCommunicator._communicate)
 
     def register_training_patches(self, patch_manager, args):
         from hcu_megatron.training.training import train
@@ -258,6 +262,7 @@ class MegatronBasicFeature(AbstractFeature):
         from hcu_megatron.training.training import train_step
         from hcu_megatron.training.training import setup_model_and_optimizer
         from hcu_megatron.training.argument_utils import core_transformer_config_from_args_wrapper
+        from hcu_megatron.training.training import save_checkpoint_and_time_wrapper
 
         # Add a fixed seed.
         patch_manager.register_patch('megatron.training.initialize._set_random_seed',
@@ -275,11 +280,16 @@ class MegatronBasicFeature(AbstractFeature):
         # prevent re-initialization of config
         patch_manager.register_patch('megatron.training.argument_utils.core_transformer_config_from_args',
                                     core_transformer_config_from_args_wrapper)
+        # support edgc, ckpt add save/load iter info to ckpt
+        patch_manager.register_patch('megatron.training.training.save_checkpoint_and_time',
+                                    save_checkpoint_and_time_wrapper,
+                                    apply_wrapper=True)
 
     def register_miscellaneous_patches(self, patch_manager, args):
-        from hcu_megatron.training.arguments import validate_args_func_decorator, _print_args
+        from hcu_megatron.core.full_cuda_graph import clone_tensors_in_struct
         from hcu_megatron.core.parallel_state import create_group, initialize_model_parallel_wrapper
         from hcu_megatron.miscellaneous.gpt_builders import gpt_builder_wrapper
+        from hcu_megatron.training.arguments import validate_args_func_decorator, _print_args
 
         patch_manager.register_patch('megatron.training.arguments.validate_args',
                                     validate_args_func_decorator,
@@ -291,16 +301,17 @@ class MegatronBasicFeature(AbstractFeature):
                                     _print_args,)
         patch_manager.register_patch('megatron.training.yaml_arguments._print_args',
                                     _print_args,)
-
         # output parallel groups
         patch_manager.register_patch('megatron.core.parallel_state.create_group', 
                                     create_group)
         patch_manager.register_patch('megatron.core.parallel_state.initialize_model_parallel',
                                     initialize_model_parallel_wrapper,
                                     apply_wrapper=True)
-
         # output model info
         patch_manager.register_patch('gpt_builders.gpt_builder',
                                     gpt_builder_wrapper,
                                     apply_wrapper=True)
+        # support full-iteration CUDA Graphs
+        patch_manager.register_patch('megatron.core.full_cuda_graph.clone_tensors_in_struct',
+                                    clone_tensors_in_struct)
         

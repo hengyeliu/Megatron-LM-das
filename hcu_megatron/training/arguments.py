@@ -7,8 +7,10 @@ import argparse
 
 from typing import Union
 from functools import wraps
-from megatron.training.arguments import add_megatron_arguments
+
 from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.training import get_args as megatron_get_args
+from megatron.training.arguments import add_megatron_arguments, parse_and_validate_args
 from megatron.training.utils import warn_rank_0
 
 from hcu_megatron.features_manager import ADAPTOR_FEATURES
@@ -77,7 +79,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
         args._explicit_args = explicit_args
 
     # Args from environment
-    if os.getenv("LAUNCH_BACKEND", "mpirun") == "torchrun":
+    if os.getenv("MEGATRON_LAUNCH_BACKEND", "torchrun") == "torchrun":
         args.rank = int(os.getenv('RANK', '0'))
         args.world_size = int(os.getenv("WORLD_SIZE", '1'))
     else:
@@ -204,6 +206,16 @@ def _add_extra_mbridge_args(parser):
                        help='The HuggingFace model path for initializing the bridge module')
     group.add_argument('--load-weights', action='store_true',
                        help='Whether to load weights for the bridge module when initializing the model')
+    group.add_argument('--save-hf-weights', action='store_true',
+                       help='Also export the model in HuggingFace format next to each Megatron '
+                            'checkpoint, under ${save}/iter_XXXXXXX/hf/. Requires --use-bridge and '
+                            '--save. The exported directory contains config.json, tokenizer files '
+                            'and safetensors weights, and can be loaded with from_pretrained().')
+    group.add_argument('--save-hf-weights-distributed', action='store_true',
+                       help='Export HuggingFace weights in distributed mode, where each rank writes '
+                            'part of the safetensors shards instead of rank 0 writing all of them. '
+                            'Reduces export time and rank-0 memory for large models. '
+                            'Only takes effect together with --save-hf-weights.')
     group.add_argument('--bridge-language-model-only', action='store_true',
                        help='For VLM bridge providers, build only the language model (MCoreGPTModel) '
                             'via provider.provide_language_model, skipping ViT / vision projector. '
@@ -243,7 +255,28 @@ def validate_args_func_decorator(validate_args_func):
         ORIGIN_ARG_VALUES["cross_entropy_fusion_impl"] = args.cross_entropy_fusion_impl
         args.cross_entropy_fusion_impl = "native"
 
+        if args.cuda_graph_impl == "full_iteration":
+            assert not args.overlap_p2p_comm, (
+                "overlap pipeline parallel communication is not supported with full-iteration cuda graphs. "
+                "If overlap_p2p_comm is True, cuda graph replay will hang"
+            )
+
         args = validate_args_func(args, defaults)
+
+        # HF-format export piggybacks on the bridge (it needs the HF config /
+        # tokenizer / weight mapping) and on the regular checkpoint schedule
+        # (it writes into ${save}/iter_XXXXXXX/hf).
+        if getattr(args, "save_hf_weights", False):
+            if not args.use_bridge:
+                raise ValueError("--save-hf-weights requires --use-bridge.")
+            if args.save is None:
+                raise ValueError("--save-hf-weights requires --save to be set.")
+        if getattr(args, "save_hf_weights_distributed", False) and not getattr(
+            args, "save_hf_weights", False
+        ):
+            raise ValueError(
+                "--save-hf-weights-distributed requires --save-hf-weights."
+            )
 
         # print env vars
         _print_env_vars("env vars", exclude_vars=["BASH_FUNC", "OMPI"])
@@ -313,42 +346,28 @@ def _print_env_vars(title, exclude_vars=None):
 
 _ADAPTOR_ARGS = None
 
-def add_args(args, key, value):
-    if key is not None:
-        key = key[2:].replace('-', '_')
-        if value is None:
-            value = True
-        elif len(value) == 1:
-            value = value[0]
-        setattr(args, key, value)
-
-
-def parser_unknown_args(args, unknown):
-    i = 0
-    key = value = None
-    while i < len(unknown):
-        if unknown[i].startswith("--"):
-            add_args(args, key, value)
-            key = unknown[i]
-            value = None
-        else:
-            if value is None:
-                value = [unknown[i]]
-            else:
-                value.append(unknown[i])
-        i += 1
-    add_args(args, key, value)
-
-
 def get_adaptor_args():
     global _ADAPTOR_ARGS
     if _ADAPTOR_ARGS is None:
         parser = argparse.ArgumentParser(description='Adaptor Arguments', allow_abbrev=False)
-        _ADAPTOR_ARGS, unknown = process_adaptor_args(parser).parse_known_args()
-        parser_unknown_args(_ADAPTOR_ARGS, unknown)
+        _ADAPTOR_ARGS, _ = process_adaptor_args(parser).parse_known_args()
+
     return _ADAPTOR_ARGS
 
 
 def destroy_adaptor_args():
     global _ADAPTOR_ARGS
     _ADAPTOR_ARGS = None
+
+
+def get_args():
+    try:
+        args = megatron_get_args()
+    except AssertionError:
+        print(
+            "WARNING: args is not initialized. Initializing args",
+            flush=True,
+        )
+        args = parse_and_validate_args()
+
+    return args

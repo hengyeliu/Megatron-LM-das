@@ -22,13 +22,14 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.tensor_parallel.utils import VocabUtility
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
-    _initialize_affine_weight_gpu,
     set_tensor_model_parallel_attributes,
 )
 from megatron.core.utils import (
     get_tensor_model_parallel_group_if_none,
     make_tp_sharded_tensor_for_checkpoint,
 )
+
+from hcu_megatron.core.tensor_parallel.layers import _initialize_affine_weight_gpu
 
 
 def _get_vocab_parallel_rank():
@@ -127,7 +128,13 @@ class VocabParallelInput(torch.nn.Module):
                 )
             )
             if config.perform_initialization:
-                _initialize_affine_weight_gpu(self.weight, init_method, partition_dim=0, stride=1)
+                _initialize_affine_weight_gpu(
+                    self.weight,
+                    init_method,
+                    partition_dim=0,
+                    stride=1,
+                    params_dtype=config.params_dtype,
+                )
             else:
                 set_tensor_model_parallel_attributes(
                     tensor=self.weight, is_parallel=True, dim=0, stride=1

@@ -134,7 +134,6 @@ from megatron.training.activation_logging import (
 from megatron.training.async_utils import maybe_finalize_async_save
 from megatron.training.dgrad_logging import disable_dgrad_logging, enable_dgrad_logging, save_dgrads
 from megatron.training.global_vars import (
-    get_args,
     get_energy_monitor,
     get_one_logger,
     get_signal_handler,
@@ -177,7 +176,7 @@ from megatron.training.utils import (
 )
 from .edgc_utils import Utils, append_time_to_csv, append_data_to_csv, read_data_from_csv
 from ..core.distributed.power_sgd import EFLayoutManager
-from hcu_megatron.training.arguments import get_adaptor_args
+from hcu_megatron.training import get_args
 
 stimer = StragglerDetector()
 
@@ -209,6 +208,65 @@ _BRIDGE_CLI_TO_CONFIG_FIELD_ALIASES = {
     "seed": ("inference_sampling_seed",),
     "rotary_interleaved": ("rotary_interleaved",),
 }
+
+
+# The AutoBridge built in setup_model_and_optimizer(), kept so that checkpoint
+# saves can export the model back to HuggingFace format without re-reading the
+# HF model. None when --use-bridge is not set.
+_BRIDGE = None
+
+
+def _set_bridge(bridge):
+    global _BRIDGE
+    _BRIDGE = bridge
+
+
+def get_bridge():
+    """Return the AutoBridge created for --use-bridge, or None."""
+    return _BRIDGE
+
+
+def save_hf_checkpoint(iteration, model):
+    """Export the model in HuggingFace format alongside the Megatron checkpoint.
+
+    Writes ${save}/iter_XXXXXXX/hf/, containing config.json, the tokenizer files
+    and safetensors weights, so the directory can be consumed directly by
+    transformers' from_pretrained().
+
+    This is collective: save_hf_pretrained() gathers weights across TP/PP/EP, so
+    every rank must call it. Only rank 0 writes the config/tokenizer artifacts
+    (unless distributed_save is on, where ranks share the weight shards).
+    """
+    args = get_args()
+    bridge = get_bridge()
+    if bridge is None:
+        print_rank_0(
+            "WARNING: --save-hf-weights is set but no bridge is available; "
+            "skipping HuggingFace export."
+        )
+        return
+
+    hf_path = os.path.join(
+        args.save, 'iter_{:07d}'.format(iteration), 'hf'
+    )
+    print_rank_0(f'  saving HuggingFace format checkpoint to {hf_path}')
+    start_time = time.time()
+
+    # save_hf_pretrained() walks named_parameters() and unwraps DDP/Float16Module
+    # itself, so the DDP-wrapped chunk list from setup_model_and_optimizer() is
+    # exactly what it expects.
+    bridge.save_hf_pretrained(
+        model,
+        hf_path,
+        show_progress=False,
+        distributed_save=getattr(args, "save_hf_weights_distributed", False),
+    )
+
+    torch.distributed.barrier()
+    print_rank_0(
+        f'  successfully saved HuggingFace format checkpoint to {hf_path} '
+        f'({time.time() - start_time:.2f}s)'
+    )
 
 
 def _bridge_select_runtime_field_names(provider, transformer_config, args):
@@ -517,7 +575,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     # Build model.
     def build_model():
-        adaptor_args = get_adaptor_args()
+        args = get_args()
         if (
             get_pg_size(pg_collection.pp) > 1
             and args.virtual_pipeline_model_parallel_size is not None
@@ -543,10 +601,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 this_model.vp_stage = i
                 model.append(this_model)
 
-        elif adaptor_args.schedule_method == "dualpipev":
+        elif args.schedule_method == "dualpipev":
             model = []
-            if adaptor_args.enable_vocab_parallel:
-                adaptor_args.dualpipev_first_chunk = True
+            if args.enable_vocab_parallel:
+                args.dualpipev_first_chunk = True
                 first_model = model_provider_func(
                     pre_process=is_pp_first_stage(pg_collection.pp),
                     post_process=False,
@@ -557,7 +615,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 )
                 model.append(first_model)
 
-                adaptor_args.dualpipev_first_chunk = False
+                args.dualpipev_first_chunk = False
                 second_model = model_provider_func(
                     pre_process=False,
                     post_process=False,
@@ -602,7 +660,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
                 return model
 
-            adaptor_args.dualpipev_first_chunk = True
+            args.dualpipev_first_chunk = True
             first_model = model_provider_func(
                 pre_process=is_pp_first_stage(pg_collection.pp),
                 post_process=False,
@@ -613,7 +671,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             first_model.model_type = model_type
             model.append(first_model)
 
-            adaptor_args.dualpipev_first_chunk = False
+            args.dualpipev_first_chunk = False
             second_model = model_provider_func(
                 pre_process=False,
                 post_process=is_pp_first_stage(pg_collection.pp),
@@ -625,7 +683,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             model.append(second_model)
 
         else:
-            if adaptor_args.enable_vocab_parallel:
+            if args.enable_vocab_parallel:
                 pre_process = is_pp_first_stage(pg_collection.pp)
 
                 model = [
@@ -882,6 +940,10 @@ def setup_model_and_optimizer(
             raise ValueError("When --use-bridge is set, --bridge-hf-model must be provided.")
         bridge = AutoBridge.from_hf_pretrained(args.bridge_hf_model)
         provider = bridge.to_megatron_provider(load_weights=args.load_weights, hf_path=args.bridge_hf_model)
+        # Keep the bridge alive past model construction so that checkpoint saves
+        # can re-use it to export the model back to HuggingFace format. It owns
+        # the HF config / tokenizer / weight mapping needed for the conversion.
+        _set_bridge(bridge)
 
         # For VLM providers, optionally skip the vision tower and only build the
         # language model. get_model → _create_model calls provider.provide(), so
@@ -3055,5 +3117,11 @@ def save_checkpoint_and_time_wrapper(fn):
         fn(iteration, model, optimizer, opt_param_scheduler,
            num_floating_point_operations_so_far, checkpointing_context,
            non_persistent_ckpt=non_persistent_ckpt, train_data_iterator=train_data_iterator)
+
+        # Export the same iteration in HuggingFace format next to the Megatron
+        # checkpoint. Skipped for non-persistent checkpoints, which are local
+        # scratch state for fast restart rather than a published checkpoint.
+        if getattr(args, "save_hf_weights", False) and not non_persistent_ckpt:
+            save_hf_checkpoint(iteration, model)
 
     return wrapper
