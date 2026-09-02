@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 
-_HCU_NAME_MARKERS = ("hygon", "hcu", "dcu", "bw1000")
+_HCU_NAME_MARKERS = ("hygon", "hcu", "bw1000")
 _HCU_ARCH_RE = re.compile(r"^gfx[0-9]+$")
 
 
