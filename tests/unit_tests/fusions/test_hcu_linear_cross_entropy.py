@@ -84,6 +84,25 @@ class FakeTensor:
             is_cuda=self.is_cuda,
         )
 
+    def clone(self):
+        return FakeTensor(
+            self.shape,
+            self.dtype,
+            device=self.device,
+            contiguous=self._contiguous,
+            is_cuda=self.is_cuda,
+        )
+
+    def __getitem__(self, item):
+        start, stop, _ = item.indices(self.shape[0])
+        return FakeTensor(
+            (stop - start,) + self.shape[1:],
+            self.dtype,
+            device=self.device,
+            contiguous=self._contiguous,
+            is_cuda=self.is_cuda,
+        )
+
 
 class FakeTorch:
     bfloat16 = "bfloat16"
@@ -142,7 +161,12 @@ class TestExtension(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             library = Path(temporary_directory) / "libhcu_linear_ce_gfx936.so"
             library.touch()
-            namespace = SimpleNamespace(forward=mock.Mock(), backward=mock.Mock())
+            namespace = SimpleNamespace(
+                forward=mock.Mock(),
+                backward=mock.Mock(),
+                forward_partials=mock.Mock(),
+                forward_finalize=mock.Mock(),
+            )
             ops = SimpleNamespace()
 
             def load_library(_path: str) -> None:
@@ -165,6 +189,7 @@ class TestExtension(unittest.TestCase):
 class TestEntry(unittest.TestCase):
     def test_forward_passes_detected_architecture_to_native_loader(self) -> None:
         hidden, weight, labels = _inputs()
+        partials = ("lse", "target_logit")
         native_outputs = ("loss", "maximum", "acc", "valid")
         with (
             mock.patch.object(entry_module, "_get_torch", return_value=FakeTorch()),
@@ -175,15 +200,25 @@ class TestEntry(unittest.TestCase):
             ),
             mock.patch.object(
                 entry_module.extension,
-                "invoke_forward",
+                "invoke_forward_partials",
+                return_value=partials,
+            ) as invoke_partials,
+            mock.patch.object(
+                entry_module.extension,
+                "invoke_forward_finalize",
                 return_value=native_outputs,
-            ) as invoke,
+            ) as invoke_finalize,
         ):
             outputs = entry_module.forward(hidden, weight, labels)
         self.assertEqual(outputs[:4], native_outputs)
         self.assertEqual(outputs[4:6], (0, 1))
         self.assertIs(outputs[6], hidden)
-        self.assertEqual(invoke.call_args.args[-1], "gfx938")
+        self.assertEqual(invoke_partials.call_args.args[-1], "gfx938")
+        self.assertEqual(invoke_finalize.call_args.args[-1], "gfx938")
+        # Data parallel runs the same two-stage path with shard offset zero, so
+        # the single-rank result stays the unsplit arithmetic.
+        self.assertEqual(invoke_partials.call_args.args[3], 0)
+        self.assertEqual(invoke_finalize.call_args.args[:2], partials)
 
     def test_backward_restores_three_dimensional_hidden_shape(self) -> None:
         hidden, weight, labels = _inputs((32, 64, 4096), (32, 64))
@@ -223,14 +258,210 @@ class TestEntry(unittest.TestCase):
             )
         self.assertEqual(dhidden.shape, hidden.shape)
         self.assertIs(observed_dweight, dweight)
-        self.assertEqual(invoke.call_args.args[-1], "gfx936")
+        self.assertEqual(invoke.call_args.args[-2], "gfx936")
+        # Data parallel differentiates the whole vocabulary, offset zero.
+        self.assertEqual(invoke.call_args.args[-1], 0)
 
     def test_rejects_unsupported_parallelism_and_reduction(self) -> None:
         hidden, weight, labels = _inputs()
-        with self.assertRaisesRegex(NotImplementedError, "DP only"):
-            entry_module.forward(hidden, weight, labels, tp_group=object())
+        with self.assertRaisesRegex(ValueError, "requires a tp_group"):
+            entry_module.forward(hidden, weight, labels, sequence_parallel=True)
         with self.assertRaisesRegex(NotImplementedError, "reduction='mean'"):
             entry_module.forward(hidden, weight, labels, reduction="sum")
+
+    def test_sequence_parallel_forward_gathers_tokens_before_computing(self) -> None:
+        # Each rank holds a quarter of the tokens; the loss needs all of them.
+        hidden, weight, labels = _inputs((512, 4096), (2048,))
+        gathered = FakeTensor((2048, 4096), "bfloat16")
+        group = object()
+        with (
+            mock.patch.object(entry_module, "_get_torch", return_value=FakeTorch()),
+            mock.patch.object(
+                entry_module,
+                "require_hcu",
+                return_value=SimpleNamespace(arch="gfx936"),
+            ),
+            mock.patch.object(
+                entry_module, "_group_rank_and_size", return_value=(1, 4)
+            ),
+            mock.patch.object(entry_module, "_validate_vocab_sharding"),
+            mock.patch.object(
+                entry_module, "_gather_sequence", return_value=gathered
+            ) as gather,
+            mock.patch.object(
+                entry_module,
+                "_combine_partials",
+                side_effect=lambda _torch, _group, _world, lse, target: (lse, target),
+            ),
+            mock.patch.object(
+                entry_module.extension,
+                "invoke_forward_partials",
+                return_value=("lse", "target_logit"),
+            ) as invoke_partials,
+            mock.patch.object(
+                entry_module.extension,
+                "invoke_forward_finalize",
+                return_value=("loss", "maximum", "acc", "valid"),
+            ),
+        ):
+            outputs = entry_module.forward(
+                hidden, weight, labels, tp_group=group, sequence_parallel=True
+            )
+        self.assertEqual(gather.call_count, 1)
+        self.assertIs(gather.call_args.args[3], hidden)
+        # The native call and the saved tensor both see the gathered tokens.
+        self.assertEqual(invoke_partials.call_args.args[0].shape, (2048, 4096))
+        self.assertIs(outputs[6], gathered)
+
+    def test_sequence_parallel_backward_returns_only_this_ranks_rows(self) -> None:
+        _, weight, labels = _inputs((2048, 4096), (2048,))
+        global_hidden = FakeTensor((2048, 4096), "bfloat16")
+        dloss = FakeTensor((), "float32")
+        maximum = FakeTensor((2048,), "float32")
+        saved_lse = FakeTensor((2048,), "float32")
+        valid_count = FakeTensor((), "int64")
+        flat_dhidden = FakeTensor((2048, 4096), "bfloat16")
+        dweight = FakeTensor((32000, 4096), "bfloat16")
+        group = object()
+        all_reduce = mock.Mock()
+        fake_dist = SimpleNamespace(
+            all_reduce=all_reduce, ReduceOp=SimpleNamespace(SUM="sum")
+        )
+        with (
+            mock.patch.object(entry_module, "_get_torch", return_value=FakeTorch()),
+            mock.patch.object(
+                entry_module,
+                "require_hcu",
+                return_value=SimpleNamespace(arch="gfx936"),
+            ),
+            mock.patch.object(
+                entry_module, "_group_rank_and_size", return_value=(1, 4)
+            ),
+            mock.patch.object(entry_module, "_get_distributed", return_value=fake_dist),
+            mock.patch.object(
+                entry_module.extension,
+                "invoke_backward",
+                return_value=(flat_dhidden, dweight),
+            ),
+        ):
+            dhidden, _ = entry_module.backward(
+                dloss,
+                global_hidden,
+                weight,
+                labels,
+                maximum,
+                saved_lse,
+                valid_count,
+                "mean",
+                -100,
+                group,
+                1,
+                4,
+                True,
+            )
+        # One all_reduce over the whole gradient, then a slice; no reduce_scatter.
+        self.assertEqual(all_reduce.call_count, 1)
+        self.assertEqual(dhidden.shape, (512, 4096))
+
+    def test_rejects_vocabulary_shard_that_is_not_256_aligned(self) -> None:
+        hidden, _, labels = _inputs()
+        weight = FakeTensor((31999, 4096), "bfloat16")
+        with (
+            mock.patch.object(entry_module, "_get_torch", return_value=FakeTorch()),
+            mock.patch.object(
+                entry_module,
+                "require_hcu",
+                return_value=SimpleNamespace(arch="gfx936"),
+            ),
+            self.assertRaisesRegex(ValueError, "make-vocab-size-divisible-by 256"),
+        ):
+            entry_module.forward(hidden, weight, labels)
+
+    def test_tensor_parallel_forward_offsets_labels_by_rank_shard(self) -> None:
+        hidden, weight, labels = _inputs()
+        group = object()
+        with (
+            mock.patch.object(entry_module, "_get_torch", return_value=FakeTorch()),
+            mock.patch.object(
+                entry_module,
+                "require_hcu",
+                return_value=SimpleNamespace(arch="gfx936"),
+            ),
+            mock.patch.object(
+                entry_module, "_group_rank_and_size", return_value=(3, 4)
+            ),
+            mock.patch.object(entry_module, "_validate_vocab_sharding"),
+            mock.patch.object(
+                entry_module,
+                "_combine_partials",
+                side_effect=lambda _torch, _group, _world, lse, target: (lse, target),
+            ) as combine,
+            mock.patch.object(
+                entry_module.extension,
+                "invoke_forward_partials",
+                return_value=("lse", "target_logit"),
+            ) as invoke_partials,
+            mock.patch.object(
+                entry_module.extension,
+                "invoke_forward_finalize",
+                return_value=("loss", "maximum", "acc", "valid"),
+            ),
+        ):
+            outputs = entry_module.forward(hidden, weight, labels, tp_group=group)
+        self.assertEqual(invoke_partials.call_args.args[3], 3 * 32000)
+        self.assertEqual(outputs[4:6], (3, 4))
+        self.assertEqual(combine.call_count, 1)
+
+    def test_tensor_parallel_backward_all_reduces_hidden_gradient_once(self) -> None:
+        hidden, weight, labels = _inputs((2048, 4096), (2048,))
+        dloss = FakeTensor((), "float32")
+        maximum = FakeTensor((2048,), "float32")
+        saved_lse = FakeTensor((2048,), "float32")
+        valid_count = FakeTensor((), "int64")
+        flat_dhidden = FakeTensor((2048, 4096), "bfloat16")
+        dweight = FakeTensor((32000, 4096), "bfloat16")
+        group = object()
+        all_reduce = mock.Mock()
+        fake_dist = SimpleNamespace(
+            all_reduce=all_reduce, ReduceOp=SimpleNamespace(SUM="sum")
+        )
+        with (
+            mock.patch.object(entry_module, "_get_torch", return_value=FakeTorch()),
+            mock.patch.object(
+                entry_module,
+                "require_hcu",
+                return_value=SimpleNamespace(arch="gfx936"),
+            ),
+            mock.patch.object(
+                entry_module, "_group_rank_and_size", return_value=(2, 4)
+            ),
+            mock.patch.object(entry_module, "_get_distributed", return_value=fake_dist),
+            mock.patch.object(
+                entry_module.extension,
+                "invoke_backward",
+                return_value=(flat_dhidden, dweight),
+            ) as invoke,
+        ):
+            _, observed_dweight = entry_module.backward(
+                dloss,
+                hidden,
+                weight,
+                labels,
+                maximum,
+                saved_lse,
+                valid_count,
+                "mean",
+                -100,
+                group,
+                2,
+                4,
+                False,
+            )
+        self.assertEqual(invoke.call_args.args[-1], 2 * 32000)
+        self.assertEqual(all_reduce.call_count, 1)
+        self.assertEqual(all_reduce.call_args.kwargs["group"], group)
+        # The weight gradient is the rank's own shard and is returned untouched.
+        self.assertIs(observed_dweight, dweight)
 
 
 class TestRepositoryContract(unittest.TestCase):
