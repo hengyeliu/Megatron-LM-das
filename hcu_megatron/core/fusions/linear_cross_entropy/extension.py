@@ -17,6 +17,10 @@ class HcuLinearCeExtensionError(RuntimeError):
 
 _ARCH_RE = re.compile(r"^gfx[0-9]+$")
 _LOADED_PATHS: set[Path] = set()
+# forward_partials and forward_finalize carry the vocabulary-parallel forward;
+# a library predating them cannot serve TP or SP, so the loader rejects it
+# rather than letting the first TP step fail with an attribute error.
+_REQUIRED_OPS = ("forward", "backward", "forward_partials", "forward_finalize")
 
 
 def _get_torch() -> Any:
@@ -64,7 +68,7 @@ def _registered_ops(torch_module: Any) -> Any | None:
     namespace = getattr(getattr(torch_module, "ops", None), "hcu_linear_ce", None)
     if namespace is None:
         return None
-    if getattr(namespace, "forward", None) is None or getattr(namespace, "backward", None) is None:
+    if any(getattr(namespace, name, None) is None for name in _REQUIRED_OPS):
         return None
     return namespace
 
@@ -98,8 +102,8 @@ def require_ops(
     registered = _registered_ops(torch)
     if registered is None:
         raise HcuLinearCeExtensionError(
-            "loaded HCU Linear CE extension does not register both "
-            "torch.ops.hcu_linear_ce.forward and backward"
+            "loaded HCU Linear CE extension does not register "
+            + ", ".join(f"torch.ops.hcu_linear_ce.{name}" for name in _REQUIRED_OPS)
         )
     return registered
 
@@ -121,6 +125,44 @@ def invoke_forward(
     return tuple(outputs)  # type: ignore[return-value]
 
 
+def invoke_forward_partials(
+    hidden: Any,
+    weight: Any,
+    labels: Any,
+    shard_vocab_start: int,
+    ignore_index: int,
+    log_kernel: bool,
+    arch: str,
+) -> tuple[Any, Any]:
+    """Return this rank's ``(lse_local, target_logit_local)`` over its shard."""
+    outputs = require_ops(arch).forward_partials(
+        hidden, weight, labels, shard_vocab_start, ignore_index, log_kernel
+    )
+    if not isinstance(outputs, (tuple, list)) or len(outputs) != 2:
+        raise HcuLinearCeExtensionError(
+            "torch.ops.hcu_linear_ce.forward_partials must return "
+            "(lse_local, target_logit_local)"
+        )
+    return tuple(outputs)  # type: ignore[return-value]
+
+
+def invoke_forward_finalize(
+    lse: Any,
+    target_logit: Any,
+    labels: Any,
+    ignore_index: int,
+    arch: str,
+) -> tuple[Any, Any, Any, Any]:
+    """Turn cross-rank-combined partials into the loss and saved tensors."""
+    outputs = require_ops(arch).forward_finalize(lse, target_logit, labels, ignore_index)
+    if not isinstance(outputs, (tuple, list)) or len(outputs) != 4:
+        raise HcuLinearCeExtensionError(
+            "torch.ops.hcu_linear_ce.forward_finalize must return "
+            "(loss, maximum, acc, num_valid_tokens)"
+        )
+    return tuple(outputs)  # type: ignore[return-value]
+
+
 def invoke_backward(
     dlogprobs: Any,
     global_hidden: Any,
@@ -131,6 +173,7 @@ def invoke_backward(
     num_valid_tokens: Any,
     log_kernel: bool,
     arch: str,
+    shard_vocab_start: int = 0,
 ) -> tuple[Any, Any]:
     outputs = require_ops(arch).backward(
         dlogprobs,
@@ -141,6 +184,7 @@ def invoke_backward(
         acc,
         num_valid_tokens,
         log_kernel,
+        shard_vocab_start,
     )
     if not isinstance(outputs, (tuple, list)) or len(outputs) != 2:
         raise HcuLinearCeExtensionError(
@@ -158,6 +202,8 @@ __all__ = [
     "default_extension_path",
     "invoke_backward",
     "invoke_forward",
+    "invoke_forward_finalize",
+    "invoke_forward_partials",
     "require_ops",
     "reset_loader_state",
 ]
