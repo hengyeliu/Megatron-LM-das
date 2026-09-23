@@ -9,6 +9,7 @@ from typing import Union
 from functools import wraps
 
 from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP
 from megatron.training import get_args as megatron_get_args
 from megatron.training.arguments import add_megatron_arguments, parse_and_validate_args
 from megatron.training.utils import warn_rank_0
@@ -28,7 +29,7 @@ def remove_original_params(parser, param_names: Union[list, str]):
                     del parser._option_string_actions[option_string]
 
 
-def process_adaptor_args(parser):
+def add_adaptor_args(parser):
     # add extra arguments
     parser = _add_extra_network_size_args(parser)
     parser = _add_extra_training_args(parser)
@@ -54,7 +55,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
         parser = extra_args_provider(parser)
 
     # add adaptor args
-    parser = process_adaptor_args(parser)
+    parser = add_adaptor_args(parser)
 
     # Parse.
     explicit_args = {
@@ -113,10 +114,10 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
 
 
 def _add_extra_network_size_args(parser):
-    # 删除原参数
+    # remove original argument
     remove_original_params(parser, ["normalization"])
 
-    # 重定义参数
+    # override the parameter definition
     group = parser.add_argument_group(title='extra network size args')
     group.add_argument('--normalization', default='LayerNorm',
                        choices=['LayerNorm', 'RMSNorm', 'LightopRMSNorm'],
@@ -170,10 +171,10 @@ def _add_extra_initialization_args(parser):
 
 
 def _add_extra_tokenizer_args(parser):
-    # 删除原参数
+    # remove original argument
     remove_original_params(parser, ["tokenizer_type"])
 
-    # 重定义参数
+    # override the parameter definition
     group = parser.add_argument_group(title='extra tokenizer args')
     group.add_argument('--extra-vocab-size', type=int, default=0,
                        help="--extra-vocab-size")
@@ -261,6 +262,20 @@ def validate_args_func_decorator(validate_args_func):
                 "If overlap_p2p_comm is True, cuda graph replay will hang"
             )
 
+        if args.sync_free_moe_backend == "deepep":
+            args.moe_flex_dispatcher_backend = "deepep"
+            if args.moe_token_dispatcher_type != "flex":
+                warn_rank_0(f"DeepEP backend is only supported with flex token dispatcher.")
+                args.moe_token_dispatcher_type = "flex"
+            assert args.use_primus_grouped_gemm, "--use-primus-grouped-gemm should be set when enabling sync free moe with deepep."
+            assert not args.use_primus_deepep, "--use-primus-deepep should NOT be set when enabling sync free moe with deepep."
+
+        if args.use_primus_deepep:
+            assert HAVE_DEEP_EP, "DeepEP is not available"
+            if args.moe_token_dispatcher_type != "flex":
+                warn_rank_0(f"Primus DeepEP backend is only supported with flex token dispatcher.")
+                args.moe_token_dispatcher_type = "flex"
+
         args = validate_args_func(args, defaults)
 
         # HF-format export piggybacks on the bridge (it needs the HF config /
@@ -286,8 +301,13 @@ def validate_args_func_decorator(validate_args_func):
             if key in args_dict:
                 setattr(args, key, value)
 
+        adaptor_args = get_adaptor_args()
         for feature in ADAPTOR_FEATURES:
-            args = feature.validate_args(args)
+            if (
+                (getattr(adaptor_args, feature.feature_name, None) and feature.optimization_level == 2)
+                or feature.default_patches
+            ):
+                args = feature.validate_args(args)
 
         return args
 
@@ -344,14 +364,22 @@ def _print_env_vars(title, exclude_vars=None):
         print(f'-------------------- end of {title} ---------------------', flush=True)
 
 
+def parse_adaptor_args():
+    parser = argparse.ArgumentParser(description='Adaptor Arguments', allow_abbrev=False)
+    adaptor_args, _ = add_adaptor_args(parser).parse_known_args()
+
+    return adaptor_args
+
+
 _ADAPTOR_ARGS = None
 
-def get_adaptor_args():
+def set_adaptor_args(adaptor_args):
     global _ADAPTOR_ARGS
-    if _ADAPTOR_ARGS is None:
-        parser = argparse.ArgumentParser(description='Adaptor Arguments', allow_abbrev=False)
-        _ADAPTOR_ARGS, _ = process_adaptor_args(parser).parse_known_args()
+    _ADAPTOR_ARGS = adaptor_args
 
+
+def get_adaptor_args():
+    assert _ADAPTOR_ARGS is not None, 'adaptor_args is not initialized.'
     return _ADAPTOR_ARGS
 
 
