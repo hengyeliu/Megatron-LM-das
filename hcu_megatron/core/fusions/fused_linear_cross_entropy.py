@@ -68,6 +68,7 @@ class LinearCrossEntropy(torch.autograd.Function):
         reduction: typing.Literal["none", "sum", "mean"] = "mean",
         ignore_index: int = -100,
         sequence_parallel: bool = False,
+        gradient_accumulation_fusion: bool = True,
     ) -> torch.Tensor:
         """
         The forward pass of the Linear Cross Entropy.
@@ -177,6 +178,10 @@ class LinearCrossEntropy(torch.autograd.Function):
             ctx.tp_rank = tp_rank
             ctx.tp_world_size = tp_world_size
             ctx.sequence_parallel = sequence_parallel
+            # Mirrors vocab_output.py: the caller passes in the value of
+            # config.gradient_accumulation_fusion, because the autograd Function
+            # itself has no view of config.
+            ctx.gradient_accumulation_fusion = gradient_accumulation_fusion
 
         return logprobs
 
@@ -203,6 +208,39 @@ class LinearCrossEntropy(torch.autograd.Function):
             tp_rank = ctx.tp_rank
             tp_world_size = ctx.tp_world_size
             sequence_parallel = ctx.sequence_parallel
+            gradient_accumulation_fusion = ctx.gradient_accumulation_fusion
+
+            # Mirror of the non-fused path in vocab_output.py. When Megatron's
+            # gradient accumulation fusion is on, the vocabulary wgrad GEMM is
+            # expected to accumulate straight into the fp32 weight.main_grad
+            # with beta=1 and to hand DDP a placeholder tensor, because the
+            # DDP post-hook otherwise performs an extra full read-modify-write
+            # of main_grad per micro-batch. That extra pass costs ~1.31 GB of
+            # HBM traffic per micro-batch and, more importantly, steals
+            # bandwidth from the concurrently running dgrad GEMMs.
+            #
+            # `zero_out_wgrad` must stay on the fallback side. Megatron sets it
+            # when the embedding and output layers are tied on one pipeline
+            # stage, and distributed_data_parallel.py then forces
+            # main_grad.add_(param.grad) even when grad_added_to_main_grad is
+            # set — precisely so that the accumulation cannot start from
+            # torch.empty garbage. Feeding it an unwritten placeholder would
+            # resurrect exactly the bug that flag exists to prevent.
+            #
+            # A non-fp32 main_grad also falls back: the accumulation is fp32 by
+            # definition, and the non-fused implementation refuses anything but
+            # float32 or fp16/bfloat16 there.
+            main_grad = getattr(weight, 'main_grad', None)
+            use_main_grad = (
+                gradient_accumulation_fusion
+                and main_grad is not None
+                and main_grad.dtype == torch.float32
+                and not getattr(weight, 'zero_out_wgrad', False)
+            )
+            if use_main_grad:
+                # Tell DDP not to add our gradient into main_grad a second
+                # time. The native dW GEMM has already done it.
+                weight.grad_added_to_main_grad = True
 
             d_hidden, d_weight = _get_platform().backward_func(
                 dlogprobs,
@@ -218,9 +256,14 @@ class LinearCrossEntropy(torch.autograd.Function):
                 tp_rank,
                 tp_world_size,
                 sequence_parallel,
+                main_grad if use_main_grad else None,
             )
 
-        return d_hidden, d_weight, None, None, None, None, None
+        # One gradient slot per forward input, minus ctx: hidden, weight,
+        # labels, tp_group, reduction, ignore_index, sequence_parallel,
+        # gradient_accumulation_fusion. The trailing None belongs to the new
+        # trailing input; dropping it is an arity error, not a silent default.
+        return d_hidden, d_weight, None, None, None, None, None, None
 
 
 def linear_cross_entropy(
@@ -231,12 +274,27 @@ def linear_cross_entropy(
     reduction: typing.Literal["none", "sum", "mean"] = "mean",
     ignore_index: int = -100,
     sequence_parallel: bool = False,
+    gradient_accumulation_fusion: bool = True,
 ) -> torch.Tensor:
     """
     helper function for linear cross entropy.
+
+    ``gradient_accumulation_fusion`` is forwarded to the autograd Function so
+    that its backward can decide whether the vocabulary wgrad may accumulate
+    straight into ``weight.main_grad``. The default matches Megatron's, whose
+    only switch is the negated ``--no-gradient-accumulation-fusion``.
     """
     _impl = LinearCrossEntropy.apply
-    return _impl(hidden, weight, labels, tp_group, reduction, ignore_index, sequence_parallel)
+    return _impl(
+        hidden,
+        weight,
+        labels,
+        tp_group,
+        reduction,
+        ignore_index,
+        sequence_parallel,
+        gradient_accumulation_fusion,
+    )
 
 
 __all__ = ["linear_cross_entropy", "LinearCrossEntropy"]

@@ -285,8 +285,19 @@ def backward(
     tp_rank: int,
     tp_world_size: int,
     sequence_parallel: bool,
+    main_grad: Any = None,
 ) -> tuple[Any, Any]:
-    """Return ``(d_hidden, d_weight)`` to PR2256 LinearCrossEntropy.backward."""
+    """Return ``(d_hidden, d_weight)`` to PR2256 LinearCrossEntropy.backward.
+
+    ``main_grad`` is ``weight.main_grad`` when the caller has decided that the
+    dW GEMM may accumulate into it directly. In that case the second returned
+    element is an uninitialised full-shape placeholder: the native kernel has
+    already folded the gradient into ``main_grad`` with ``beta=1``, and DDP is
+    told to skip its own ``main_grad.add_(grad)``. This is the same division of
+    labour the non-fused ``vocab_output.py`` uses. The caller owns the decision
+    — and the ``grad_added_to_main_grad`` flag that goes with it — because only
+    it can see ``ctx``.
+    """
     _validate_parallelism(tp_group, sequence_parallel)
     torch = _get_torch()
     expected_rank, expected_world_size = _group_rank_and_size(torch, tp_group)
@@ -318,6 +329,15 @@ def backward(
         raise ValueError("maximum and acc must each have shape (N,)")
     if num_valid_tokens.dim() != 0 or num_valid_tokens.dtype != torch.int64:
         raise ValueError("num_valid_tokens must be a scalar int64 tensor")
+    if main_grad is not None:
+        if not bool(getattr(main_grad, "is_cuda", False)) or main_grad.device != weight.device:
+            raise ValueError("main_grad must be on the same HCU device as weight")
+        if main_grad.dtype != torch.float32:
+            raise ValueError("main_grad must be float32")
+        if tuple(main_grad.shape) != tuple(weight.shape):
+            raise ValueError("main_grad must have the same shape as weight")
+        if not _is_contiguous(main_grad):
+            raise ValueError("main_grad must be contiguous")
     d_hidden, d_weight = extension.invoke_backward(
         dlogprobs,
         hidden_view,
@@ -329,6 +349,7 @@ def backward(
         _env_flag("HCU_LINEAR_CE_LOG_KERNEL"),
         platform.arch,
         tp_rank * int(weight.shape[0]),
+        main_grad,
     )
     if tp_world_size > 1:
         # Each rank differentiated only its own vocabulary slice, so the hidden

@@ -174,7 +174,16 @@ def invoke_backward(
     log_kernel: bool,
     arch: str,
     shard_vocab_start: int = 0,
+    main_grad: Any = None,
 ) -> tuple[Any, Any]:
+    # `main_grad` is the fp32 accumulation buffer of `weight`. When it is given,
+    # the native dW GEMM accumulates into it with beta=1 and never writes the
+    # bf16 d_weight, so the second element of the returned pair is an
+    # uninitialised full-shape placeholder. It keeps the [local_vocab, D] shape
+    # because autograd checks the tangent returned for `weight` against the
+    # forward input's shape; the arity stays at two so the autograd Function and
+    # the PR2256-shaped contract are unaffected. Only DDP reads the flag that
+    # suppresses the second accumulation, never the contents.
     outputs = require_ops(arch).backward(
         dlogprobs,
         global_hidden,
@@ -185,6 +194,7 @@ def invoke_backward(
         num_valid_tokens,
         log_kernel,
         shard_vocab_start,
+        main_grad,
     )
     if not isinstance(outputs, (tuple, list)) or len(outputs) != 2:
         raise HcuLinearCeExtensionError(
