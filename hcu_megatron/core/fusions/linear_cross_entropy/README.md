@@ -23,11 +23,17 @@ hcu_megatron/core/fusions/
 
 - hidden、weight：BF16、连续、同一 HCU device
 - labels：int64、连续、同一 HCU device
-- reduction：`mean`
+- reduction：`mean`（`none` 未实现）
 - ignore index：`-100`
-- 并行：DP only，`tp_group=None`、`sequence_parallel=False`
+- 并行：DP / TP / SP，`tp_group=None` 即 DP
+- `main_grad` 累加缓冲区：fp32 或 bf16（非融合侧 `wgrad_gemm_accum_fp32` / `wgrad_gemm_accum_fp16` 的对应）
 - hidden 支持 2D 或 3D，native 调用前展平成 `(N,D)`，backward 恢复原 shape
 - 当前已在 gfx936 验证两个问题规模，框架代码本身不写死 shape
+
+**TP/SP 的 256 对齐约束落在词表分片上。** 前向跑在无边界分支的 Tensile MT256x256 上，
+走到的范围是本 rank 的 `V_local = V_global / tp_world_size`，因此需要
+`--make-vocab-size-divisible-by 256`；`N`、`D` 同样要 256 对齐。各 rank 的 `V_local`
+必须相等（PR2256 的等分词表假设），首次调用用一次 `all_gather` 校验并缓存结果。
 
 ## 安装和加载
 
@@ -200,5 +206,5 @@ export HCU_LINEAR_CE_TUNING_MODE=retune
 - `HCU Linear CE backend unavailable`：确认 PyTorch 能看到 HCU、已加载 DTK 环境，并且设备名或架构信息能识别为 HCU。
 - `extension is not installed or loaded`：安装与当前 `gfxNNN` 匹配的 wheel，或设置 `HCU_LINEAR_CE_EXTENSION_PATH`。
 - `loaded ... does not register both ... forward and backward`：检查 `.so` 是否来自完整 native 构建，且没有混用不同架构或不同构建目录的对象。
-- 输入校验失败：当前实现要求 BF16 hidden/weight、int64 labels、连续张量、`mean`、`ignore_index=-100`、DP only；hidden 可为 2D 或 3D。
+- 输入校验失败：当前实现要求 BF16 hidden/weight、int64 labels、连续张量、`mean`、`ignore_index=-100`；hidden 可为 2D 或 3D。TP/SP 下另需 `V_local`、`N`、`D` 均 256 对齐。
 - 选优日志缺少候选 sample：将 `HCU_LINEAR_CE_LOG_LEVEL` 设为 `2`，并在首次使用该问题签名的新进程中运行。

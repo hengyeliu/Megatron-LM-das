@@ -108,6 +108,14 @@ class FakeTorch:
     bfloat16 = "bfloat16"
     int64 = "int64"
 
+    @staticmethod
+    def empty(shape, **kwargs):
+        return FakeTensor(
+            shape,
+            kwargs.get("dtype", "bfloat16"),
+            device=kwargs.get("device", "hcu:0"),
+        )
+
 
 def _inputs(hidden_shape=(2048, 4096), label_shape=(2048,)):
     return (
@@ -258,9 +266,11 @@ class TestEntry(unittest.TestCase):
             )
         self.assertEqual(dhidden.shape, hidden.shape)
         self.assertIs(observed_dweight, dweight)
-        self.assertEqual(invoke.call_args.args[-2], "gfx936")
+        self.assertEqual(invoke.call_args.args[8], "gfx936")
         # Data parallel differentiates the whole vocabulary, offset zero.
-        self.assertEqual(invoke.call_args.args[-1], 0)
+        self.assertEqual(invoke.call_args.args[9], 0)
+        # ...and the accumulation buffer is supplied by the caller, not assumed.
+        self.assertIsNone(invoke.call_args.args[10])
 
     def test_rejects_unsupported_parallelism_and_reduction(self) -> None:
         hidden, weight, labels = _inputs()
@@ -324,8 +334,11 @@ class TestEntry(unittest.TestCase):
         dweight = FakeTensor((32000, 4096), "bfloat16")
         group = object()
         all_reduce = mock.Mock()
+        reduce_scatter = mock.Mock()
         fake_dist = SimpleNamespace(
-            all_reduce=all_reduce, ReduceOp=SimpleNamespace(SUM="sum")
+            all_reduce=all_reduce,
+            reduce_scatter_tensor=reduce_scatter,
+            ReduceOp=SimpleNamespace(SUM="sum"),
         )
         with (
             mock.patch.object(entry_module, "_get_torch", return_value=FakeTorch()),
@@ -359,8 +372,10 @@ class TestEntry(unittest.TestCase):
                 4,
                 True,
             )
-        # One all_reduce over the whole gradient, then a slice; no reduce_scatter.
-        self.assertEqual(all_reduce.call_count, 1)
+        # One reduce_scatter over the whole gradient; the full gradient is never
+        # materialised and no slice-and-clone follows it.
+        self.assertEqual(reduce_scatter.call_count, 1)
+        self.assertEqual(all_reduce.call_count, 0)
         self.assertEqual(dhidden.shape, (512, 4096))
 
     def test_rejects_vocabulary_shard_that_is_not_256_aligned(self) -> None:
@@ -457,7 +472,7 @@ class TestEntry(unittest.TestCase):
                 4,
                 False,
             )
-        self.assertEqual(invoke.call_args.args[-1], 2 * 32000)
+        self.assertEqual(invoke.call_args.args[9], 2 * 32000)
         self.assertEqual(all_reduce.call_count, 1)
         self.assertEqual(all_reduce.call_args.kwargs["group"], group)
         # The weight gradient is the rank's own shard and is returned untouched.
@@ -481,6 +496,7 @@ class TestRepositoryContract(unittest.TestCase):
                 "reduction",
                 "ignore_index",
                 "sequence_parallel",
+                "gradient_accumulation_fusion",
             ],
         )
         text = PUBLIC_API_PATH.read_text(encoding="utf-8")

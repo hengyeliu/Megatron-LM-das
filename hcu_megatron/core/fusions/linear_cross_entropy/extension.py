@@ -176,8 +176,15 @@ def invoke_backward(
     shard_vocab_start: int = 0,
     main_grad: Any = None,
 ) -> tuple[Any, Any]:
-    # `main_grad` is the fp32 accumulation buffer of `weight`. When it is given,
-    # the native dW GEMM accumulates into it with beta=1 and never writes the
+    # `main_grad` is the accumulation buffer of `weight`, in fp32 or bf16 —
+    # the two element types Megatron can produce for this operator and the two
+    # vocab_output.py accumulates into, through wgrad_gemm_accum_fp32 and
+    # wgrad_gemm_accum_fp16 respectively. Its dtype is `grad_dtype`, which is
+    # fp32 when gradients are reduced in fp32 (bf16 training auto-enables that)
+    # and otherwise `param.dtype`, always bf16 here because the forward requires
+    # bf16 hidden and weight. Anything else is rejected before this call.
+    # When it is given, the native dW GEMM accumulates into it with beta=1 using
+    # the buffer's own element type as its C matrix type, and never writes the
     # bf16 d_weight, so the second element of the returned pair is an
     # uninitialised full-shape placeholder. It keeps the [local_vocab, D] shape
     # because autograd checks the tangent returned for `weight` against the

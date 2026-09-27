@@ -332,8 +332,24 @@ def backward(
     if main_grad is not None:
         if not bool(getattr(main_grad, "is_cuda", False)) or main_grad.device != weight.device:
             raise ValueError("main_grad must be on the same HCU device as weight")
-        if main_grad.dtype != torch.float32:
-            raise ValueError("main_grad must be float32")
+        # The buffer's element type is the accumulation's element type. fp32 is
+        # what Megatron hands us under bf16 training, because bf16 auto-enables
+        # --accumulate-allreduce-grads-in-fp32; with that switch off it is bf16,
+        # since param_and_grad_buffer.py falls back to the parameter's own dtype
+        # (grad_dtype = torch.float if grad_reduce_in_fp32 else param.dtype).
+        # Those are the two arithmetic vocab_output.py serves, through
+        # wgrad_gemm_accum_fp32 and wgrad_gemm_accum_fp16, and the native dW GEMM
+        # takes the buffer's type as its C matrix element type.
+        #
+        # fp16 is deliberately not accepted. It cannot arise here: this operator
+        # requires bf16 hidden and weight (see the forward's dtype check), so
+        # param.dtype is bf16 and grad_dtype is fp32 or bf16 and nothing else.
+        # Under --fp16 the model would have fp16 parameters and the fused forward
+        # would reject them long before the backward chose a buffer type.
+        if main_grad.dtype not in (torch.float32, torch.bfloat16):
+            raise ValueError(
+                f"main_grad must be float32 or bfloat16, got {main_grad.dtype}"
+            )
         if tuple(main_grad.shape) != tuple(weight.shape):
             raise ValueError("main_grad must have the same shape as weight")
         if not _is_contiguous(main_grad):
@@ -351,23 +367,41 @@ def backward(
         tp_rank * int(weight.shape[0]),
         main_grad,
     )
-    if tp_world_size > 1:
-        # Each rank differentiated only its own vocabulary slice, so the hidden
-        # gradient is a partial sum. This is the same single collective the
-        # non-fused column-parallel path performs, moved here unchanged, and it
-        # sits outside the native pipeline on purpose: the backward autotuner
-        # replays that pipeline once per candidate, and a collective inside it
-        # would desynchronise the group.
-        dist = _get_distributed(torch)
-        dist.all_reduce(d_hidden, op=dist.ReduceOp.SUM, group=tp_group)
-    d_hidden = d_hidden.view(*global_hidden.shape)
-    if sequence_parallel:
+    dist = _get_distributed(torch) if tp_world_size > 1 else None
+    if sequence_parallel and tp_world_size > 1:
         # The caller passed in a sequence shard and expects a gradient of the
-        # same shape. PR2256 slices the all-reduced gradient rather than
-        # replacing the all_reduce with a reduce_scatter, so the collective
-        # count stays the same as the tensor-parallel path.
-        rows = int(global_hidden.shape[0]) // tp_world_size
-        d_hidden = d_hidden[tp_rank * rows : (tp_rank + 1) * rows].clone()
+        # same shape, so only this rank's rows of the reduction are ever needed.
+        # PR2256 all-reduces the full gradient and then slices this rank's rows
+        # out of it, which computes the other ranks' shares of every row and
+        # throws them away. reduce_scatter_tensor lands the identical slice in a
+        # single collective: its rank r output is the r-th contiguous block of
+        # the input along the flattened token axis, which is exactly the block
+        # the slice used to select. The two are not bit-identical — the
+        # summation order differs — but they agree to the tolerance of the
+        # collective itself, and the gradient is no longer materialised in full.
+        shard_shape = (int(global_hidden.shape[0]) // tp_world_size,) + tuple(
+            int(extent) for extent in global_hidden.shape[1:]
+        )
+        d_hidden_shard = torch.empty(
+            shard_shape, device=d_hidden.device, dtype=d_hidden.dtype
+        )
+        dist.reduce_scatter_tensor(
+            d_hidden_shard.view(-1, int(global_hidden.shape[-1])),
+            d_hidden,
+            op=dist.ReduceOp.SUM,
+            group=tp_group,
+        )
+        d_hidden = d_hidden_shard
+    else:
+        if tp_world_size > 1:
+            # Each rank differentiated only its own vocabulary slice, so the hidden
+            # gradient is a partial sum. This is the same single collective the
+            # non-fused column-parallel path performs, moved here unchanged, and it
+            # sits outside the native pipeline on purpose: the backward autotuner
+            # replays that pipeline once per candidate, and a collective inside it
+            # would desynchronise the group.
+            dist.all_reduce(d_hidden, op=dist.ReduceOp.SUM, group=tp_group)
+        d_hidden = d_hidden.view(*global_hidden.shape)
     # d_weight needs no communication at all: the rows this rank produced are
     # exactly the rows of the shard it owns.
     return d_hidden, d_weight

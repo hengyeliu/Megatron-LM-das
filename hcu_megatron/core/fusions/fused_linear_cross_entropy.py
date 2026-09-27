@@ -72,9 +72,12 @@ class LinearCrossEntropy(torch.autograd.Function):
     ) -> torch.Tensor:
         """
         The forward pass of the Linear Cross Entropy.
-        The HCU overlay retains the PR2256 call surface, but currently accepts
-        only its documented DP contract. TP, SP, and other
-        reductions fail closed in the backend before native launch.
+        The HCU overlay retains the PR2256 call surface. DP, TP and SP are all
+        served; the layout below is the PR2256 one and the backend follows it.
+        ``reduction="none"`` is not implemented and fails closed in the backend
+        before native launch. TP shifts the forward's vocab range to this rank's
+        shard, so the 256-divisibility constraint applies to the shard and not to
+        the global vocabulary: ``--make-vocab-size-divisible-by 256`` is required.
 
         If tp_group is not None, the weight tensor to each TP rank should be
         (global_vocab_size // world_size, dim).
@@ -212,7 +215,7 @@ class LinearCrossEntropy(torch.autograd.Function):
 
             # Mirror of the non-fused path in vocab_output.py. When Megatron's
             # gradient accumulation fusion is on, the vocabulary wgrad GEMM is
-            # expected to accumulate straight into the fp32 weight.main_grad
+            # expected to accumulate straight into the weight.main_grad buffer
             # with beta=1 and to hand DDP a placeholder tensor, because the
             # DDP post-hook otherwise performs an extra full read-modify-write
             # of main_grad per micro-batch. That extra pass costs ~1.31 GB of
@@ -227,14 +230,23 @@ class LinearCrossEntropy(torch.autograd.Function):
             # torch.empty garbage. Feeding it an unwritten placeholder would
             # resurrect exactly the bug that flag exists to prevent.
             #
-            # A non-fp32 main_grad also falls back: the accumulation is fp32 by
-            # definition, and the non-fused implementation refuses anything but
-            # float32 or fp16/bfloat16 there.
+            # The two accepted element types are the ones vocab_output.py
+            # serves: fp32 through wgrad_gemm_accum_fp32, bf16 through
+            # wgrad_gemm_accum_fp16. Megatron picks fp32 for bf16 training
+            # (auto-enabled --accumulate-allreduce-grads-in-fp32) and bf16 when
+            # that switch is off, where param_and_grad_buffer.py falls back to
+            # the parameter's own dtype. The native dW GEMM takes the buffer's
+            # own element type as its C matrix type, so both reproduce the
+            # non-fused arithmetic rather than approximating it.
+            #
+            # fp16 is not accepted. This operator requires bf16 hidden and
+            # weight, so grad_dtype is fp32 or bf16 and never fp16; an fp16
+            # buffer here would mean a model this backend cannot serve anyway.
             main_grad = getattr(weight, 'main_grad', None)
             use_main_grad = (
                 gradient_accumulation_fusion
                 and main_grad is not None
-                and main_grad.dtype == torch.float32
+                and main_grad.dtype in (torch.float32, torch.bfloat16)
                 and not getattr(weight, 'zero_out_wgrad', False)
             )
             if use_main_grad:
