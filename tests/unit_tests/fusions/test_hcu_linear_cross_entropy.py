@@ -182,16 +182,34 @@ class TestExtension(unittest.TestCase):
 
             torch_module = SimpleNamespace(ops=ops)
             torch_module.ops.load_library = mock.Mock(side_effect=load_library)
-            environ = {"HCU_LINEAR_CE_EXTENSION_PATH": str(library)}
-            first = extension_module.require_ops(
-                "gfx936", torch_module=torch_module, environ=environ
-            )
-            second = extension_module.require_ops(
-                "gfx936", torch_module=torch_module, environ=environ
-            )
+            environ = {
+                "HCU_LINEAR_CE_BACKEND": "legacy",
+                "HCU_LINEAR_CE_EXTENSION_PATH": str(library),
+            }
+            with mock.patch.object(extension_module, "_get_torch", return_value=torch_module):
+                first = extension_module.require_ops("gfx936", environ=environ)
+                second = extension_module.require_ops("gfx936", environ=environ)
             self.assertIs(first, namespace)
             self.assertIs(second, namespace)
             torch_module.ops.load_library.assert_called_once_with(str(library.resolve()))
+
+    def test_backend_defaults_to_flashtrain_and_accepts_legacy(self) -> None:
+        self.assertEqual(extension_module._select_backend({}), "flashtrain")
+        self.assertEqual(
+            extension_module._select_backend({"HCU_LINEAR_CE_BACKEND": "legacy"}),
+            "legacy",
+        )
+        self.assertEqual(
+            extension_module._select_backend({"HCU_LINEAR_CE_BACKEND": "flash_train"}),
+            "flashtrain",
+        )
+
+    def test_backend_rejects_unknown_value(self) -> None:
+        with self.assertRaisesRegex(
+            extension_module.HcuLinearCeExtensionError,
+            "expected 'flashtrain' or 'legacy'",
+        ):
+            extension_module._select_backend({"HCU_LINEAR_CE_BACKEND": "other"})
 
 
 class TestEntry(unittest.TestCase):

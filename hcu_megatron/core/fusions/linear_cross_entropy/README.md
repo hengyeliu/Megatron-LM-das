@@ -136,14 +136,25 @@ python -m pip install hcu_linear_ce_artifacts_gfx936-*.whl
 
 wheel 名称和库文件名都带架构标识；gfx936 和 gfx938 应分别构建、分别安装和分别验证。Megatron Python 接口不随架构复制。
 
-loader 默认根据当前 HCU 的 `gfxNNN` 架构发现 wheel 中的库。实际搜索顺序是：`HCU_LINEAR_CE_EXTENSION_PATH`、已安装的 `hcu_linear_ce_artifacts`、Megatron package-local `linear_cross_entropy/lib/libhcu_linear_ce_<arch>.so`。现场调试可用环境变量覆盖默认发现路径：
+loader 默认使用 FlashTrain Torch adapter。迁移验证期间可通过
+`HCU_LINEAR_CE_BACKEND` 显式选择后端：
+
+```bash
+# 默认值，使用 flash_train.torch
+export HCU_LINEAR_CE_BACKEND=flashtrain
+
+# 兼容旧版 torch.ops.hcu_linear_ce loader
+export HCU_LINEAR_CE_BACKEND=legacy
+```
+
+当 backend 为 `legacy` 时，loader 根据当前 HCU 的 `gfxNNN` 架构发现旧 wheel 中的库。实际搜索顺序是：`HCU_LINEAR_CE_EXTENSION_PATH`、已安装的 `hcu_linear_ce_artifacts`、Megatron package-local `linear_cross_entropy/lib/libhcu_linear_ce_<arch>.so`。现场调试可用环境变量覆盖默认发现路径：
 
 ```bash
 export HCU_LINEAR_CE_EXTENSION_PATH=/path/to/libhcu_linear_ce_gfx936.so
 ```
 覆盖路径只应指向已经完成 native 正确性验证的架构专属 `.so`。首次进程调用可能包含动态库加载、Torch op 注册和在线选优，这些启动成本不代表稳态调用。
 
-加载链路是：`entry.py` 做输入和并行语义检查，`platform.py` 检测 HCU 与架构，`extension.py` 调用 `torch.ops.load_library()` 加载 `.so`，然后通过 `torch.ops.hcu_linear_ce.forward/backward` 调用 native 实现。Megatron 不读取汇编、`.co`、manifest 或 shape 表。
+加载链路是：`entry.py` 做输入和并行语义检查，`platform.py` 检测 HCU 与架构；FlashTrain backend 通过 `flash_train.torch` 调用 staged bindings，legacy backend 则由 `extension.py` 调用 `torch.ops.load_library()` 并通过 `torch.ops.hcu_linear_ce.*` 调用旧实现。Megatron 不读取汇编、`.co`、manifest 或 shape 表。
 
 ## 从源码到 Megatron 的完整操作
 

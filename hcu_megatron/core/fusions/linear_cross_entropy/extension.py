@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Load the architecture-specific HCU Linear CE shared library."""
+"""Bridge Megatron's Linear CE contract to the FlashTrain Torch adapter."""
 
 from __future__ import annotations
 
@@ -16,10 +16,11 @@ class HcuLinearCeExtensionError(RuntimeError):
 
 
 _ARCH_RE = re.compile(r"^gfx[0-9]+$")
+_BACKEND_ENV = "HCU_LINEAR_CE_BACKEND"
 _LOADED_PATHS: set[Path] = set()
-# forward_partials and forward_finalize carry the vocabulary-parallel forward;
-# a library predating them cannot serve TP or SP, so the loader rejects it
-# rather than letting the first TP step fail with an attribute error.
+_FLASH_TRAIN_BINDING: Any | None = None
+# The legacy custom-op loader still validates this set when an explicit
+# torch_module is supplied by compatibility tests or older tooling.
 _REQUIRED_OPS = ("forward", "backward", "forward_partials", "forward_finalize")
 
 
@@ -38,6 +39,18 @@ def _validate_arch(arch: str) -> str:
     if not _ARCH_RE.fullmatch(normalized):
         raise HcuLinearCeExtensionError(f"invalid HCU architecture: {arch!r}")
     return normalized
+
+
+def _select_backend(environ: Mapping[str, str] | None = None) -> str:
+    values = os.environ if environ is None else environ
+    backend = values.get(_BACKEND_ENV, "flashtrain").strip().lower()
+    if backend in {"flashtrain", "flash_train"}:
+        return "flashtrain"
+    if backend == "legacy":
+        return "legacy"
+    raise HcuLinearCeExtensionError(
+        f"invalid {_BACKEND_ENV}={backend!r}; expected 'flashtrain' or 'legacy'"
+    )
 
 
 def default_extension_path(
@@ -78,6 +91,36 @@ def require_ops(
     torch_module: Any | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> Any:
+    # The production path uses the official flash_train.torch adapter. Keep
+    # the explicit torch_module path for loader-only compatibility tests and
+    # older callers that still exercise the legacy custom-op loader.
+    if torch_module is None and _select_backend(environ) == "flashtrain":
+        global _FLASH_TRAIN_BINDING
+        if _FLASH_TRAIN_BINDING is None:
+            try:
+                import flash_train.torch as ft_binding
+            except ImportError as exc:
+                raise HcuLinearCeExtensionError(
+                    "flash_train.torch is required for the HCU Linear CE backend; "
+                    "install flash-train with FTRAIN_BUILD_TORCH_BINDINGS=ON"
+                ) from exc
+            missing = [
+                name
+                for name in (
+                    "linear_ce_forward_partials",
+                    "linear_ce_forward_finalize",
+                    "linear_ce_backward",
+                )
+                if not hasattr(ft_binding, name)
+            ]
+            if missing:
+                raise HcuLinearCeExtensionError(
+                    "flash_train.torch is missing Linear CE bindings: "
+                    + ", ".join(missing)
+                )
+            _FLASH_TRAIN_BINDING = ft_binding
+        return _FLASH_TRAIN_BINDING
+
     torch = _get_torch() if torch_module is None else torch_module
     registered = _registered_ops(torch)
     if registered is not None:
@@ -116,10 +159,23 @@ def invoke_forward(
     log_kernel: bool,
     arch: str,
 ) -> tuple[Any, Any, Any, Any]:
-    outputs = require_ops(arch).forward(hidden, weight, labels, ignore_index, log_kernel)
+    binding = require_ops(arch)
+    if hasattr(binding, "linear_ce_forward_partials"):
+        if ignore_index != -100:
+            raise NotImplementedError(
+                "flash_train Linear CE supports ignore_index=-100 only"
+            )
+        lse_local, target_logit_local = binding.linear_ce_forward_partials(
+            hidden, weight, labels, 0
+        )
+        outputs = binding.linear_ce_forward_finalize(
+            lse_local, target_logit_local, labels
+        )
+    else:
+        outputs = binding.forward(hidden, weight, labels, ignore_index, log_kernel)
     if not isinstance(outputs, (tuple, list)) or len(outputs) != 4:
         raise HcuLinearCeExtensionError(
-            "torch.ops.hcu_linear_ce.forward must return "
+            "Linear CE forward must return "
             "(loss, maximum, acc, num_valid_tokens)"
         )
     return tuple(outputs)  # type: ignore[return-value]
@@ -135,12 +191,22 @@ def invoke_forward_partials(
     arch: str,
 ) -> tuple[Any, Any]:
     """Return this rank's ``(lse_local, target_logit_local)`` over its shard."""
-    outputs = require_ops(arch).forward_partials(
-        hidden, weight, labels, shard_vocab_start, ignore_index, log_kernel
-    )
+    binding = require_ops(arch)
+    if hasattr(binding, "linear_ce_forward_partials"):
+        if ignore_index != -100:
+            raise NotImplementedError(
+                "flash_train Linear CE supports ignore_index=-100 only"
+            )
+        outputs = binding.linear_ce_forward_partials(
+            hidden, weight, labels, shard_vocab_start
+        )
+    else:
+        outputs = binding.forward_partials(
+            hidden, weight, labels, shard_vocab_start, ignore_index, log_kernel
+        )
     if not isinstance(outputs, (tuple, list)) or len(outputs) != 2:
         raise HcuLinearCeExtensionError(
-            "torch.ops.hcu_linear_ce.forward_partials must return "
+            "Linear CE forward_partials must return "
             "(lse_local, target_logit_local)"
         )
     return tuple(outputs)  # type: ignore[return-value]
@@ -154,10 +220,18 @@ def invoke_forward_finalize(
     arch: str,
 ) -> tuple[Any, Any, Any, Any]:
     """Turn cross-rank-combined partials into the loss and saved tensors."""
-    outputs = require_ops(arch).forward_finalize(lse, target_logit, labels, ignore_index)
+    binding = require_ops(arch)
+    if hasattr(binding, "linear_ce_forward_finalize"):
+        if ignore_index != -100:
+            raise NotImplementedError(
+                "flash_train Linear CE supports ignore_index=-100 only"
+            )
+        outputs = binding.linear_ce_forward_finalize(lse, target_logit, labels)
+    else:
+        outputs = binding.forward_finalize(lse, target_logit, labels, ignore_index)
     if not isinstance(outputs, (tuple, list)) or len(outputs) != 4:
         raise HcuLinearCeExtensionError(
-            "torch.ops.hcu_linear_ce.forward_finalize must return "
+            "Linear CE forward_finalize must return "
             "(loss, maximum, acc, num_valid_tokens)"
         )
     return tuple(outputs)  # type: ignore[return-value]
@@ -191,27 +265,43 @@ def invoke_backward(
     # forward input's shape; the arity stays at two so the autograd Function and
     # the PR2256-shaped contract are unaffected. Only DDP reads the flag that
     # suppresses the second accumulation, never the contents.
-    outputs = require_ops(arch).backward(
-        dlogprobs,
-        global_hidden,
-        weight,
-        labels,
-        maximum,
-        acc,
-        num_valid_tokens,
-        log_kernel,
-        shard_vocab_start,
-        main_grad,
-    )
+    binding = require_ops(arch)
+    if hasattr(binding, "linear_ce_backward"):
+        outputs = binding.linear_ce_backward(
+            dlogprobs,
+            global_hidden,
+            weight,
+            labels,
+            maximum,
+            acc,
+            num_valid_tokens,
+            shard_vocab_start,
+            main_grad,
+        )
+    else:
+        outputs = binding.backward(
+            dlogprobs,
+            global_hidden,
+            weight,
+            labels,
+            maximum,
+            acc,
+            num_valid_tokens,
+            log_kernel,
+            shard_vocab_start,
+            main_grad,
+        )
     if not isinstance(outputs, (tuple, list)) or len(outputs) != 2:
         raise HcuLinearCeExtensionError(
-            "torch.ops.hcu_linear_ce.backward must return (d_hidden, d_weight)"
+            "Linear CE backward must return (d_hidden, d_weight)"
         )
     return tuple(outputs)  # type: ignore[return-value]
 
 
 def reset_loader_state() -> None:
     _LOADED_PATHS.clear()
+    global _FLASH_TRAIN_BINDING
+    _FLASH_TRAIN_BINDING = None
 
 
 __all__ = [
